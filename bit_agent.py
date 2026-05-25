@@ -17,6 +17,16 @@ see the AXES note and the PARADIGMS table.
 paradigm's rubric is rejected, not softly downweighted. Strict
 paradigms will have higher rejection rates. That is the point.
 
+Query-driven selection
+----------------------
+The default flow now reads a user prompt (via --query or interactively)
+and selects the activities whose names and prompts most overlap with
+that query, using a stop-word-filtered content-token bag with crude
+suffix stemming. The point is to surface the everyday acts that
+*resonate* with what's on the user's mind, then show how each paradigm
+would frame each of them. Pass --random to ignore the query and pick
+activities uniformly at random instead.
+
 Hooks the model
 ---------------
 BitNet is loaded inline via transformers — no dependency on x.py or any
@@ -31,9 +41,11 @@ runs in eager mode and doesn't need MSVC / g++ available on PATH.
 
 Examples
 --------
-    python everyday.py --mock --n 4
-    python everyday.py --mock --paradigm stoic --paradigm care --show-text
-    python everyday.py --paradigm communitarian --n 3       # real BitNet
+    python everyday.py --mock --query "I'm stuck and avoiding everything"
+    python everyday.py --mock --query "my mother is unwell" --show-text
+    python everyday.py --query "I can't sleep" --paradigm stoic --paradigm care
+    python everyday.py --mock --random --n 4                       # old behavior
+    python everyday.py                                             # asks you
 """
 
 from __future__ import annotations
@@ -55,6 +67,69 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# 0. SHARED TEXT UTILITIES — used by geometry selection and comparator
+# ---------------------------------------------------------------------------
+
+_WORD_RE = re.compile(r"[A-Za-z']+")
+_SENT_RE = re.compile(r"(?<=[.!?])\s+")
+
+# Stopwords are themselves a choice — these are mostly grammatical glue
+# plus a few high-frequency mental-state verbs ("feel", "think") that
+# would otherwise dominate the overlap signal for almost every query.
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "when",
+    "while", "of", "in", "on", "at", "to", "for", "with", "from", "by",
+    "as", "is", "are", "was", "were", "be", "been", "being", "have",
+    "has", "had", "do", "does", "did", "will", "would", "could", "should",
+    "may", "might", "must", "can", "i", "me", "my", "mine", "myself",
+    "we", "us", "our", "ours", "you", "your", "yours", "he", "she", "it",
+    "they", "them", "their", "this", "that", "these", "those", "what",
+    "which", "who", "whom", "how", "why", "where", "there", "here", "so",
+    "just", "very", "really", "some", "any", "all", "no", "not", "only",
+    "now", "today", "tonight", "tomorrow", "yesterday", "again", "still",
+    "also", "too", "more", "less", "much", "many", "few", "feel", "feeling",
+    "think", "thinking", "thought", "want", "wanted", "wants", "need",
+    "needs", "about", "into", "out", "up", "down", "over", "under",
+    "through", "right", "kind", "sort", "way", "ways", "thing", "things",
+    "stuff", "really", "im", "ive", "id", "dont", "cant", "wont", "isnt",
+    "thats", "whats", "lot", "lots", "bit", "going", "got", "get",
+    # Indefinite/generic words that pad prompts but carry no signal.
+    "something", "anything", "everything", "nothing",
+    "anyone", "everyone", "nobody", "anybody", "everybody",
+    "good", "bad", "well", "better", "worse", "best", "worst",
+    "make", "makes", "made", "making", "take", "takes", "took", "taking",
+    "come", "comes", "came", "coming", "give", "gives", "gave", "giving",
+})
+
+
+def _tokens(text: str) -> list[str]:
+    return [w.lower() for w in _WORD_RE.findall(text)]
+
+
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in _SENT_RE.split(text.strip()) if s.strip()]
+
+
+def _stem(word: str) -> str:
+    """Crude suffix stripper. Not linguistically correct, just consistent.
+
+    "running" -> "runn", "feels" -> "feel", "worked" -> "work".
+    Consistency matters more than correctness: identical inputs produce
+    identical stems on both sides of the comparison.
+    """
+    for suffix in ("ings", "ing", "edly", "ed", "ly", "es", "s"):
+        if word.endswith(suffix) and len(word) > len(suffix) + 2:
+            return word[: -len(suffix)]
+    return word
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Stop-word-filtered, stemmed bag of content tokens."""
+    return {_stem(w) for w in _tokens(text)
+            if w not in _STOPWORDS and len(w) > 2}
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +169,76 @@ class Activity:
     name: str
     coord: Coord
     prompt: str
+
+
+
+
+# Concept tags per activity. These bridge user vocabulary to activity
+# vocabulary — a query about "partner upset" can match "apologising" via
+# the shared tag "conflict", even though no surface word overlaps.
+# Tags are matched alongside the activity's name and prompt tokens; tag
+# matches are weighted more heavily because they're curated.
+_ACTIVITY_TAGS: dict[str, frozenset[str]] = {
+    # Routine / Domestic
+    "waiting in line":              frozenset({"waiting", "pause", "patience", "public", "boredom"}),
+    "taking a shower":              frozenset({"body", "private", "ritual", "morning", "reflection"}),
+    "doing laundry":                frozenset({"chore", "repetitive", "domestic", "routine", "alone"}),
+    "eating lunch alone":           frozenset({"meal", "alone", "lonely", "work", "solitude", "midday"}),
+    "making coffee":                frozenset({"morning", "ritual", "small", "routine", "domestic"}),
+    "folding clothes":              frozenset({"chore", "repetitive", "domestic", "routine", "quiet"}),
+    "walking the dog":              frozenset({"walk", "outside", "routine", "animal", "evening"}),
+    "taking out the trash":         frozenset({"chore", "domestic", "small", "routine"}),
+    "watering the plants":          frozenset({"care", "domestic", "small", "ritual", "attention"}),
+    "tidying the desk":             frozenset({"transition", "work", "clearing", "preparation"}),
+
+    # Social / Relational
+    "meeting someone new":          frozenset({"introduction", "stranger", "social", "anxious", "nervous", "worried", "first"}),
+    "catching up with a friend":    frozenset({"friend", "social", "conversation", "reunion", "care"}),
+    "helping a stranger":           frozenset({"help", "stranger", "kindness", "moral", "interruption"}),
+    "receiving criticism":          frozenset({"feedback", "hurt", "criticism", "conflict", "self", "stung", "argument"}),
+    "giving a compliment":          frozenset({"praise", "kindness", "social", "small", "generous"}),
+    "apologising":                  frozenset({"apology", "hurt", "conflict", "fight", "argument", "repair", "partner", "wife", "husband", "boyfriend", "girlfriend", "relationship", "family", "mother", "father", "parent", "mom", "dad", "sister", "brother", "sorry", "regret"}),
+    "being ignored":                frozenset({"lonely", "rejected", "hurt", "invisible", "social", "sad"}),
+    "forgiving someone":            frozenset({"forgive", "hurt", "conflict", "fight", "argument", "repair", "anger", "angry", "resentment"}),
+    "a difficult conversation":     frozenset({"conflict", "fight", "argument", "argue", "hard", "talk", "partner", "wife", "husband", "boyfriend", "girlfriend", "relationship", "family", "mother", "father", "parent", "mom", "dad", "sister", "brother", "honest", "confrontation", "upset"}),
+    "being cared for":              frozenset({"care", "received", "sick", "loved", "vulnerable", "partner", "family", "mother", "father", "parent", "mom", "dad"}),
+
+    # Work / Productivity
+    "starting a new project":       frozenset({"begin", "work", "project", "new", "anxious", "nervous", "excited"}),
+    "facing a deadline":            frozenset({"deadline", "stress", "stressed", "work", "pressure", "anxious", "worried", "overwhelmed", "rush"}),
+    "procrastinating":              frozenset({"avoid", "stuck", "overwhelmed", "anxious", "worried", "delay", "resistance", "lazy"}),
+    "finishing a task":             frozenset({"complete", "work", "done", "transition", "satisfaction", "happy"}),
+    "feeling stuck":                frozenset({"stuck", "frustrated", "blocked", "problem", "overwhelmed", "spinning", "lost"}),
+    "learning something new":       frozenset({"learn", "study", "skill", "beginner", "confused", "growth"}),
+    "making a mistake at work":     frozenset({"mistake", "error", "shame", "work", "hurt", "self", "embarrassed", "boss", "manager", "colleague"}),
+    "getting a promotion":          frozenset({"promotion", "success", "work", "milestone", "celebrate", "happy", "boss", "manager"}),
+    "being bored":                  frozenset({"bored", "empty", "restless", "unstimulated", "stuck"}),
+    "resigning":                    frozenset({"quit", "leave", "work", "transition", "milestone", "decision", "boss", "manager"}),
+
+    # Body / Health
+    "going for a run":              frozenset({"run", "exercise", "body", "outside", "movement", "morning"}),
+    "sitting with pain":            frozenset({"pain", "body", "hurt", "suffering", "endure", "physical", "sick", "ache"}),
+    "a medical appointment":        frozenset({"medical", "doctor", "health", "waiting", "anxious", "nervous", "worried", "scared", "body", "sick"}),
+    "preparing to sleep but can't": frozenset({"sleep", "insomnia", "night", "anxious", "worried", "tired", "exhausted", "mind", "racing"}),
+    "eating mindlessly":            frozenset({"eat", "mindless", "distracted", "habit", "body"}),
+    "meditating":                   frozenset({"meditate", "quiet", "attention", "stillness", "practice", "mind", "calm"}),
+    "a long walk alone":            frozenset({"walk", "alone", "solitary", "outside", "thinking", "wander"}),
+    "recovering from illness":      frozenset({"sick", "rest", "recovery", "body", "tired", "exhausted", "weak", "ill"}),
+    "getting a haircut":            frozenset({"waiting", "appearance", "small", "service", "passive"}),
+
+    # Milestone / Emotional
+    "a birthday":                   frozenset({"birthday", "milestone", "year", "time", "self", "celebrate", "happy"}),
+    "moving house":                 frozenset({"move", "change", "transition", "home", "leaving", "milestone"}),
+    "ending a friendship":          frozenset({"friend", "ending", "loss", "drift", "grief", "sad", "relationship"}),
+    "looking at old photos":        frozenset({"memory", "past", "nostalgia", "photos", "grief", "miss", "missing", "time"}),
+    "receiving bad news":           frozenset({"shock", "grief", "loss", "hard", "overwhelmed", "sad", "depressed", "scared"}),
+    "celebrating a milestone":      frozenset({"celebrate", "milestone", "success", "joy", "happy", "achievement"}),
+    "being stuck in traffic":       frozenset({"traffic", "late", "stuck", "transit", "frustrated", "angry", "waiting"}),
+    "watching the sunset":          frozenset({"beauty", "nature", "evening", "still", "noticing", "small", "peaceful"}),
+    "thinking about death":         frozenset({"death", "mortality", "fear", "scared", "meaning", "existential", "grief", "dying"}),
+    "feeling grateful":             frozenset({"gratitude", "thankful", "appreciation", "joy", "happy", "noticing"}),
+    "a disagreement online":        frozenset({"argument", "argue", "fight", "conflict", "online", "stranger", "anger", "angry", "frustrated"}),
+}
 
 
 ACTIVITIES: list[Activity] = [
@@ -238,6 +383,48 @@ class PromptGeometry:
                 out.append(a)
         return out
 
+    def select_by_query(self, query: str, n: int) -> list[tuple[Activity, float]]:
+        """Rank activities by content-token overlap with the user's query.
+
+        Three signals are combined:
+          - name overlap   (weight 2.0): activity-name tokens vs query
+          - prompt overlap (weight 1.0): activity-prompt tokens vs query
+          - tag overlap    (weight 3.0): curated concept tags vs query
+
+        Tags are the most reliable signal because they're curated to
+        bridge user vocabulary to activity vocabulary — a query about
+        "partner upset" can find "apologising" via the shared concept
+        tag "conflict", with no shared surface words required.
+
+        If no activity has any overlap at all, falls back to a random
+        sample seeded by the query (so empty queries stay deterministic).
+        """
+        q = _content_tokens(query)
+        if not q:
+            return self._seeded_random(query, n)
+
+        scored: list[tuple[Activity, float]] = []
+        for a in self.activities:
+            name_t = _content_tokens(a.name)
+            prompt_t = _content_tokens(a.prompt)
+            tag_t = {_stem(t) for t in _ACTIVITY_TAGS.get(a.name, frozenset())}
+            score = (
+                2.0 * len(q & name_t)
+                + 1.0 * len(q & prompt_t)
+                + 3.0 * len(q & tag_t)
+            )
+            scored.append((a, score))
+
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        if scored[0][1] == 0.0:
+            return self._seeded_random(query, n)
+        return scored[:n]
+
+    def _seeded_random(self, query: str, n: int) -> list[tuple[Activity, float]]:
+        rng = random.Random(hash(query) & 0xFFFFFFFF)
+        picks = rng.sample(self.activities, min(n, len(self.activities)))
+        return [(a, 0.0) for a in picks]
+
 
 # ---------------------------------------------------------------------------
 # 2. PARADIGMS — philosophical/political alignment of the instruction
@@ -363,9 +550,6 @@ PARADIGMS: dict[str, Paradigm] = {
 # 3. SIMULATOR — paradigm-conditioned generation with performance capture
 # ---------------------------------------------------------------------------
 
-# Inline BitNet loader. Tries the BF16 master weights first (no packed-weight
-# conversion scheme, so dodges the v5 transformers loading bug). Falls back
-# to the packed checkpoint if BF16 isn't available locally for some reason.
 _BITNET_CANDIDATES = (
     "microsoft/bitnet-b1.58-2B-4T",
 )
@@ -508,21 +692,11 @@ class Simulator:
 # 4. COMPARATOR — qualitative enforcement of the alignment rubric
 # ---------------------------------------------------------------------------
 
-_WORD_RE = re.compile(r"[A-Za-z']+")
-_SENT_RE = re.compile(r"(?<=[.!?])\s+")
 _IMPERATIVE_VERBS = {
     "do", "don't", "stop", "start", "go", "be", "consider", "remember",
     "notice", "ask", "try", "make", "let", "think", "take", "give",
     "hold", "listen", "attend", "accept", "refuse",
 }
-
-
-def _tokens(text: str) -> list[str]:
-    return [w.lower() for w in _WORD_RE.findall(text)]
-
-
-def _sentences(text: str) -> list[str]:
-    return [s.strip() for s in _SENT_RE.split(text.strip()) if s.strip()]
 
 
 def _count_imperatives(text: str) -> int:
@@ -659,7 +833,7 @@ class Comparator:
             for r, s in items:
                 badge = "✓" if s.enforced else "✗"
                 lines.append(
-                    f"  {badge} {r.activity:<20} "
+                    f"  {badge} {r.activity:<28} "
                     f"L={s.length_chars:>4}  lex={s.lexicon_hits}  "
                     f"imp={s.imperative_count}  ov={s.overall:.2f}"
                 )
@@ -679,7 +853,7 @@ class Comparator:
             for act, rows in cross:
                 best = max(rows, key=lambda kv: kv[1].overall)
                 summary = "  ".join(f"{n}={s.overall:.2f}" for n, s in rows)
-                lines.append(f"  {act:<22}  winner: {best[0]:<14}  {summary}")
+                lines.append(f"  {act:<28}  winner: {best[0]:<14}  {summary}")
         return "\n".join(lines)
 
 
@@ -687,13 +861,35 @@ class Comparator:
 # 5. CLI
 # ---------------------------------------------------------------------------
 
+def _resolve_query(args: argparse.Namespace) -> str | None:
+    """Decide what query text to use, or None if user asked for --random."""
+    if args.random:
+        return None
+    if args.query is not None:
+        return args.query.strip() or None
+    # interactive fallback: ask the user
+    try:
+        print("describe what's on your mind (or press Enter for a random sample):")
+        q = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return q or None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument("--query", "-q",
+                    help="user prompt to drive activity selection; "
+                         "if omitted, asks interactively")
+    ap.add_argument("--random", action="store_true",
+                    help="ignore --query and pick activities at random")
     ap.add_argument("--paradigm", action="append",
                     help="paradigm name(s); repeatable. default: all")
     ap.add_argument("--n", type=int, default=4,
-                    help="how many activities to sample (default 4)")
-    ap.add_argument("--seed", type=int, default=0)
+                    help="how many activities to use (default 4)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seed for --random sampling")
     ap.add_argument("--mock", action="store_true",
                     help="skip model load; emit canned paradigm text")
     ap.add_argument("--max-new-tokens", type=int, default=180)
@@ -711,14 +907,36 @@ def main() -> None:
             sys.exit(2)
 
     geom = PromptGeometry()
-    activities = geom.sample(args.n, seed=args.seed)
+
+    query = _resolve_query(args)
+    if query is None:
+        matched = [(a, 0.0) for a in geom.sample(args.n, seed=args.seed)]
+        selection_mode = "random"
+    else:
+        matched = geom.select_by_query(query, args.n)
+        selection_mode = "query"
+
+    activities = [a for a, _ in matched]
+
+    if selection_mode == "query":
+        print(f'\nquery: "{query}"')
+        print("matched activities:")
+        for a, score in matched:
+            label = f"(relevance {score:.1f})" if score > 0 else "(no overlap; random fallback)"
+            print(f"  • {a.name:<32} {label}")
+    else:
+        print(f"\nrandom sample of {len(activities)} activity(ies):")
+        for a, _ in matched:
+            print(f"  • {a.name}")
+
+    print(f"\nrunning {len(paradigm_names)} paradigm(s) × "
+          f"{len(activities)} activity(ies)"
+          f"{' (mock mode)' if args.mock else ''}\n")
+
     sim = Simulator(mock=args.mock, max_new_tokens=args.max_new_tokens)
     cmp_ = Comparator()
     scored: list[tuple[GenerationResult, Paradigm, QualityScore]] = []
 
-    print(f"running {len(paradigm_names)} paradigm(s) × "
-          f"{len(activities)} activity(ies)"
-          f"{' (mock mode)' if args.mock else ''}")
     for pname in paradigm_names:
         p = PARADIGMS[pname]
         for act in activities:
@@ -735,10 +953,14 @@ def main() -> None:
     print(cmp_.report(scored))
 
     if args.json:
-        payload = [
-            {"generation": asdict(r), "paradigm": p.name, "score": asdict(s)}
-            for r, p, s in scored
-        ]
+        payload = {
+            "query": query,
+            "selection_mode": selection_mode,
+            "results": [
+                {"generation": asdict(r), "paradigm": p.name, "score": asdict(s)}
+                for r, p, s in scored
+            ],
+        }
         args.json.write_text(json.dumps(payload, indent=2, default=str))
         print(f"\nwrote {args.json}")
 

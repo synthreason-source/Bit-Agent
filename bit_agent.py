@@ -23,6 +23,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_ID = "microsoft/bitnet-b1.58-2B-4T"
 
+import os
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 def load(device: str | None = None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")

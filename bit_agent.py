@@ -282,7 +282,6 @@ PARADIGMS: dict[str, Paradigm] = {
 # conversion scheme, so dodges the v5 transformers loading bug). Falls back
 # to the packed checkpoint if BF16 isn't available locally for some reason.
 _BITNET_CANDIDATES = (
-    "microsoft/bitnet-b1.58-2B-4T-bf16",
     "microsoft/bitnet-b1.58-2B-4T",
 )
 

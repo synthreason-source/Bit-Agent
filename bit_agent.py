@@ -132,6 +132,30 @@ def _content_tokens(text: str) -> set[str]:
             if w not in _STOPWORDS and len(w) > 2}
 
 
+def _wrap(text: str, width: int) -> list[str]:
+    """Soft-wrap a single line of text to ~width chars at word boundaries.
+
+    Used for rendering winning generations inside the report at a fixed
+    column width without pulling in textwrap (which has slightly different
+    defaults around whitespace).
+    """
+    if not text:
+        return [""]
+    words = text.split()
+    if not words:
+        return [""]
+    out: list[str] = []
+    line = words[0]
+    for w in words[1:]:
+        if len(line) + 1 + len(w) <= width:
+            line = f"{line} {w}"
+        else:
+            out.append(line)
+            line = w
+    out.append(line)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 1. GEOMETRY — a coordinate space of everyday acts
 # ---------------------------------------------------------------------------
@@ -841,9 +865,9 @@ class Comparator:
                     lines.append(f"      ! {why}")
 
         # cross-paradigm
-        by_act: dict[str, list[tuple[str, QualityScore]]] = {}
+        by_act: dict[str, list[tuple[str, GenerationResult, QualityScore]]] = {}
         for r, p, s in scored:
-            by_act.setdefault(r.activity, []).append((p.name, s))
+            by_act.setdefault(r.activity, []).append((p.name, r, s))
         cross = [(a, rows) for a, rows in by_act.items() if len(rows) >= 2]
         if cross:
             lines.append("")
@@ -851,9 +875,19 @@ class Comparator:
             lines.append("CROSS-PARADIGM COMPARISON (best alignment per activity)")
             lines.append("=" * 78)
             for act, rows in cross:
-                best = max(rows, key=lambda kv: kv[1].overall)
-                summary = "  ".join(f"{n}={s.overall:.2f}" for n, s in rows)
-                lines.append(f"  {act:<28}  winner: {best[0]:<14}  {summary}")
+                best_name, best_r, best_s = max(rows, key=lambda kv: kv[2].overall)
+                summary = "  ".join(f"{n}={s.overall:.2f}" for n, _, s in rows)
+                lines.append("")
+                lines.append(f"  {act}")
+                lines.append(f"  winner: {best_name}  ({summary})")
+                if not best_s.enforced:
+                    lines.append("  (note: winner did not pass enforcement; "
+                                 "best of a failing field)")
+                lines.append("  " + "─" * 74)
+                # wrap the winning text at ~74 cols, indented two spaces
+                for para in best_r.text.split("\n"):
+                    for chunk in _wrap(para, 74):
+                        lines.append(f"  {chunk}")
         return "\n".join(lines)
 
 

@@ -1,101 +1,4 @@
 """
-Run Microsoft's pretrained BitNet b1.58 2B4T (April 2025).
-
-Setup
------
-    pip install -U "transformers>=4.52" torch accelerate
-
-Notes
------
-- For real 1-bit speedups on CPU, use the official bitnet.cpp kernels.
-  Loading through transformers runs in BF16 (dequantized at load time) and
-  is the easiest way to use the model from Python.
-- VRAM/RAM footprint is roughly ~5 GB BF16 / ~1.2 GB with bitnet.cpp packing.
-- The model card lives at https://huggingface.co/microsoft/bitnet-b1.58-2B-4T
-"""
-
-from __future__ import annotations
-
-import argparse
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-MODEL_ID = "microsoft/bitnet-b1.58-2B-4T"
-
-import os
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
-def load(device: str | None = None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-    )
-    model.eval()
-    return model, tokenizer, device
-
-
-@torch.inference_mode()
-def chat(model, tokenizer, messages, max_new_tokens: int = 256, temperature: float = 0.7):
-    """messages: list of {'role': 'system'|'user'|'assistant', 'content': str}."""
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-    out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0,
-        temperature=max(temperature, 1e-5),
-        top_p=0.95,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    # only return the newly generated tokens
-    new_tokens = out[0, inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-
-def single_turn(prompt: str, system: str | None = None, **kw) -> str:
-    model, tokenizer, _ = load()
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    return chat(model, tokenizer, messages, **kw)
-
-
-def repl():
-    """Interactive chat loop with conversation history."""
-    model, tokenizer, device = load()
-    print(f"BitNet b1.58 2B4T loaded on {device}. type 'exit' to quit, 'reset' to clear history.\n")
-
-    history = [{"role": "system", "content": "You are a helpful assistant."}]
-    while True:
-        try:
-            user = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not user:
-            continue
-        if user.lower() in {"exit", "quit"}:
-            break
-        if user.lower() == "reset":
-            history = history[:1]
-            print("(history cleared)\n")
-            continue
-
-        history.append({"role": "user", "content": user})
-        reply = chat(model, tokenizer, history)
-        history.append({"role": "assistant", "content": reply})
-        print(f"bot> {reply}\n")
-
-
-"""
 everyday.py — a conceptual geometry of everyday-life prompts, a
 performance simulator for the generations across them, a qualitative
 comparator with hard enforcement, and a set of philosophical/political
@@ -116,9 +19,15 @@ paradigms will have higher rejection rates. That is the point.
 
 Hooks the model
 ---------------
-Imports load() from x.py (your BitNet pretrained loader). Pass --mock
-to run the whole framework with canned, paradigm-flavored outputs and
-no model load — useful for demoing on a laptop.
+BitNet is loaded inline via transformers — no dependency on x.py or any
+other external loader file. The default checkpoint is the BF16 master
+weights (microsoft/bitnet-b1.58-2B-4T-bf16), which avoids the v5
+weight-conversion path that broke the packed checkpoint. Pass --mock
+to skip the model load entirely and emit canned paradigm-flavored
+outputs — useful for demoing on a laptop.
+
+torch.compile is disabled at import (TORCHDYNAMO_DISABLE=1) so BitNet
+runs in eager mode and doesn't need MSVC / g++ available on PATH.
 
 Examples
 --------
@@ -127,6 +36,14 @@ Examples
     python everyday.py --paradigm communitarian --n 3       # real BitNet
 """
 
+from __future__ import annotations
+
+import os
+# Disable torch.compile / Inductor before anything imports torch.
+# BitNet's BitLinear is @torch.compile-decorated, which tries to JIT a CPU
+# kernel on first forward — that needs cl.exe on Windows or g++ on Linux.
+# Setting this means @torch.compile just passes through to eager mode.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 import argparse
 import json
@@ -361,6 +278,37 @@ PARADIGMS: dict[str, Paradigm] = {
 # 3. SIMULATOR — paradigm-conditioned generation with performance capture
 # ---------------------------------------------------------------------------
 
+# Inline BitNet loader. Tries the BF16 master weights first (no packed-weight
+# conversion scheme, so dodges the v5 transformers loading bug). Falls back
+# to the packed checkpoint if BF16 isn't available locally for some reason.
+_BITNET_CANDIDATES = (
+    "microsoft/bitnet-b1.58-2B-4T-bf16",
+    "microsoft/bitnet-b1.58-2B-4T",
+)
+
+
+def _load_bitnet_inline():
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    last_err = None
+    for model_id in _BITNET_CANDIDATES:
+        try:
+            tok = AutoTokenizer.from_pretrained(model_id)
+            mdl = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=torch.bfloat16, device_map=device,
+            )
+            mdl.eval()
+            return mdl, tok
+        except Exception as e:           # noqa: BLE001 — we want to try the next id
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"could not load any BitNet checkpoint from {_BITNET_CANDIDATES}: {last_err}"
+    )
+
+
 @dataclass
 class GenerationResult:
     paradigm: str
@@ -379,7 +327,7 @@ class Simulator:
     """Runs paradigm-conditioned generations and captures performance.
 
     Modes:
-      - real:  loads BitNet via x.py and generates
+      - real:  loads BitNet inline and generates
       - mock:  emits canned paradigm-flavored text instantly
     """
 
@@ -394,11 +342,7 @@ class Simulator:
     def _ensure_model(self) -> None:
         if self.mock or self._model is not None:
             return
-        try:
-            from x import load            # the file the user uploaded
-        except ImportError:
-            from bitnet_pretrained import load
-        self._model, self._tokenizer, _ = load()
+        self._model, self._tokenizer = _load_bitnet_inline()
 
     def run(self, paradigm: Paradigm, activity: Activity) -> GenerationResult:
         self._ensure_model()

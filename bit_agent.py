@@ -589,7 +589,7 @@ def _load_bitnet_inline():
         try:
             tok = AutoTokenizer.from_pretrained(model_id)
             mdl = AutoModelForCausalLM.from_pretrained(
-                model_id, torch_dtype=torch.bfloat16, device_map=device,
+                model_id, dtype=torch.bfloat16, device_map=device,
             )
             mdl.eval()
             return mdl, tok
